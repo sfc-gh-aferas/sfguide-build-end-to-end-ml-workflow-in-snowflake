@@ -39,13 +39,13 @@ CREATE OR REPLACE EXTERNAL ACCESS INTEGRATION mlops_pypi_access_integration
 -- Create an API integration with Github
 CREATE OR REPLACE API INTEGRATION GITHUB_INTEGRATION_E2E_SNOW_MLOPS
    api_provider = git_https_api
-   api_allowed_prefixes = ('https://github.com/Snowflake-Labs')
+   api_allowed_prefixes = ('https://github.com/Snowflake-Labs', 'https://github.com/sfc-gh-aferas')
    enabled = true
    comment='Git integration with Snowflake Demo Github Repository.';
 
 -- Create the integration with the Github demo repository
 CREATE OR REPLACE GIT REPOSITORY GITHUB_REPO_E2E_SNOW_MLOPS
-   ORIGIN = 'https://github.com/Snowflake-Labs/sfguide-build-end-to-end-ml-workflow-in-snowflake' 
+   ORIGIN = 'https://github.com/sfc-gh-aferas/sfguide-build-end-to-end-ml-workflow-in-snowflake' 
    API_INTEGRATION = 'GITHUB_INTEGRATION_E2E_SNOW_MLOPS' 
    COMMENT = 'Github Repository ';
 
