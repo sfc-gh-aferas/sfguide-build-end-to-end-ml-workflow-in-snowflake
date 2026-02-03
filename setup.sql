@@ -38,7 +38,7 @@ USE ROLE E2E_SNOW_MLOPS_ROLE;
 -- Create an API integration with Github
 CREATE OR REPLACE API INTEGRATION GITHUB_INTEGRATION_E2E_SNOW_MLOPS
    api_provider = git_https_api
-   api_allowed_prefixes = ('https://github.com/sfc-gh-aferas')
+   api_allowed_prefixes = ('https://github.com/Snowflake-Labs')
    API_USER_AUTHENTICATION = (TYPE = SNOWFLAKE_GITHUB_APP)
    enabled = true
    comment='Git integration with Snowflake Demo Github Repository.';
