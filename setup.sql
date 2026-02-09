@@ -43,10 +43,3 @@ CREATE OR REPLACE API INTEGRATION GITHUB_INTEGRATION_E2E_SNOW_MLOPS
    enabled = true
    comment='Git integration with Snowflake Demo Github Repository.';
 
-
---DONE! Now you can access your newly created notebook with your E2E_SNOW_MLOPS_ROLE and run through the end-to-end workflow!
-
-GRANT USAGE ON DATABASE E2E_SNOW_MLOPS_DB to ROLE ACCOUNTADMIN;
-GRANT USAGE ON SCHEMA MLOPS_SCHEMA to ROLE ACCOUNTADMIN;
-
-
