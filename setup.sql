@@ -26,7 +26,7 @@ CREATE OR REPLACE SCHEMA MLOPS_SCHEMA;
 -- Create compute pool
 CREATE COMPUTE POOL IF NOT EXISTS MLOPS_COMPUTE_POOL 
  MIN_NODES = 1
- MAX_NODES = 1
+ MAX_NODES = 3
  INSTANCE_FAMILY = CPU_X64_M;
 
 -- Using accountadmin, grant privilege to create network rules and integrations on newly created db
@@ -39,29 +39,7 @@ USE ROLE E2E_SNOW_MLOPS_ROLE;
 CREATE OR REPLACE API INTEGRATION GITHUB_INTEGRATION_E2E_SNOW_MLOPS
    api_provider = git_https_api
    api_allowed_prefixes = ('https://github.com/Snowflake-Labs')
+   API_USER_AUTHENTICATION = (TYPE = SNOWFLAKE_GITHUB_APP)
    enabled = true
    comment='Git integration with Snowflake Demo Github Repository.';
 
--- Create the integration with the Github demo repository
-CREATE OR REPLACE GIT REPOSITORY GITHUB_REPO_E2E_SNOW_MLOPS
-   ORIGIN = 'https://github.com/Snowflake-Labs/sfguide-build-end-to-end-ml-workflow-in-snowflake' 
-   API_INTEGRATION = 'GITHUB_INTEGRATION_E2E_SNOW_MLOPS' 
-   COMMENT = 'Github Repository ';
-
--- Fetch most recent files from Github repository
-ALTER GIT REPOSITORY GITHUB_REPO_E2E_SNOW_MLOPS FETCH;
-
--- Copy notebook into snowflake configure runtime settings
-CREATE OR REPLACE NOTEBOOK E2E_SNOW_MLOPS_DB.MLOPS_SCHEMA.TRAIN_DEPLOY_MONITOR_ML
-FROM '@E2E_SNOW_MLOPS_DB.MLOPS_SCHEMA.GITHUB_REPO_E2E_SNOW_MLOPS/branches/main/' 
-MAIN_FILE = 'train_deploy_monitor_ML_in_snowflake.ipynb' QUERY_WAREHOUSE = E2E_SNOW_MLOPS_WH
-RUNTIME_NAME = 'SYSTEM$BASIC_RUNTIME' 
-COMPUTE_POOL = 'MLOPS_COMPUTE_POOL'
-IDLE_AUTO_SHUTDOWN_TIME_SECONDS = 3600;
-
---DONE! Now you can access your newly created notebook with your E2E_SNOW_MLOPS_ROLE and run through the end-to-end workflow!
-
-SHOW NOTEBOOKS;
-
-GRANT USAGE ON DATABASE E2E_SNOW_MLOPS_DB to ROLE ACCOUNTADMIN;
-GRANT USAGE ON SCHEMA MLOPS_SCHEMA to ROLE ACCOUNTADMIN;

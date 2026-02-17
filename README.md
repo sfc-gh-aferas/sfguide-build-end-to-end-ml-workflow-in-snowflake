@@ -4,6 +4,7 @@
  - Train two SnowML Models
      - Baseline XGboost
      - XGboost with optimal hyper-parameters identified via Snowflake ML distributed HPO methods
+     - Track experiments to compare model performance
  - Register both models in Snowflake model registry
      - Explore model registry capabilities such as metadata tracking, inference, and explainability
      - Compare model metrics on train/test set to identify any issues of model performance or overfitting
@@ -26,5 +27,5 @@
  
  INSTRUCTIONS:
 ## Step-by-Step Guide
-For prerequisites, environment setup, step-by-step guide and instructions, please refer to the [QuickStart Guide](https://quickstarts.snowflake.com/guide/end-to-end-ml-workflow).
+For prerequisites, environment setup, step-by-step guide and instructions, please refer to the [QuickStart Guide](https://www.snowflake.com/en/developers/guides/end-to-end-ml-workflow/).
  
