@@ -16,7 +16,7 @@
         - Any shared utilities between the scripts
 
 2. In the main directory, create modular, production grade code
-    - orchestration.sql 
+    - orchestration.py 
         - uploads ml_jobs directory to a stage subdirectory
-        - creates 2 task dags (no schedule) that submit train.py and infer.py as mljobs using submit_from_stage
+        - creates 2 task dags (no schedule) that submit train.py and infer.py as mljobs using snowflake.ml.jobs.submit_from_stage
 

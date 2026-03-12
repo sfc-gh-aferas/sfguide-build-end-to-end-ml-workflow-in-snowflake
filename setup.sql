@@ -196,24 +196,62 @@ BEGIN
             UNIFORM(1, 100, RANDOM()) AS quantity,
             RANDOM() AS rand_val,
             DAYOFWEEK(d.payment_date) AS dow,
-            DAY(d.payment_date) AS dom
+            DAY(d.payment_date) AS dom,
+            HOUR(TIMEADD(hour, UNIFORM(0, 23, RANDOM()), d.payment_date::TIMESTAMP)) AS submission_hour,
+            QUARTER(d.payment_date) AS qtr,
+            MONTH(d.payment_date) AS mth
         FROM date_range d,
-        TABLE(GENERATOR(ROWCOUNT => 28)) g
+        TABLE(GENERATOR(ROWCOUNT => 137)) g
     ),
     enriched AS (
         SELECT 
             t.*,
-            -- Determine if this is a suspicious transaction
+            -- Risk factors that correlate with overpayments (realistic patterns)
+            -- High-risk approvers (APR001-APR003 have 3x higher fraud rate)
+            t.approver_id IN ('APR001', 'APR002', 'APR003') AS is_high_risk_approver,
+            -- High-risk vendors (V003, V004 have history of billing issues)
+            t.vendor_id IN ('V003', 'V004') AS is_problem_vendor,
+            -- Rush periods: month-end (dom >= 26), quarter-end, fiscal year-end
+            (t.dom >= 26 OR (t.mth IN (3, 6, 9, 12) AND t.dom >= 20)) AS is_rush_period,
+            -- Off-hours submission (before 7am or after 7pm = suspicious)
+            (t.submission_hour < 7 OR t.submission_hour > 19) AS is_off_hours,
+            -- Large amounts more likely to have errors
+            t.base_amount > 20000 AS is_large_amount,
+            -- Determine if this is a suspicious transaction with REALISTIC CORRELATIONS
             CASE 
-                WHEN t.rand_val < 0.03 THEN TRUE  -- Duplicate payment
-                WHEN t.rand_val < 0.08 THEN TRUE  -- Pricing/fraud
-                WHEN t.vendor_id IN ('V001', 'V002', 'V005', 'V006', 'V007', 'V010') AND t.rand_val <= 0.15 AND t.rand_val >= 0.08 THEN TRUE -- Unclaimed rebate
+                -- Duplicate payments: higher rate for problem vendors, rush periods, off-hours
+                WHEN t.rand_val < 0.005 THEN TRUE  -- Base 0.5% random duplicates
+                WHEN t.vendor_id IN ('V003', 'V004') AND t.rand_val < 0.04 THEN TRUE  -- Problem vendors: 4%
+                WHEN t.approver_id IN ('APR001', 'APR002', 'APR003') AND t.rand_val < 0.05 THEN TRUE  -- Risky approvers: 5%
+                WHEN (t.dom >= 26) AND t.rand_val < 0.06 THEN TRUE  -- Month-end rush: 6%
+                WHEN (t.submission_hour < 7 OR t.submission_hour > 19) AND t.rand_val < 0.07 THEN TRUE  -- Off-hours: 7%
+                WHEN t.base_amount > 30000 AND t.rand_val < 0.08 THEN TRUE  -- Large amounts: 8%
+                -- Pricing errors: correlate with specific vendor categories and amounts
+                WHEN t.vendor_id IN ('V004') AND t.base_amount > 15000 AND t.rand_val < 0.12 THEN TRUE  -- Consulting overcharges
+                WHEN t.vendor_id IN ('V002', 'V010') AND t.rand_val < 0.06 THEN TRUE  -- IT equipment pricing issues
+                -- Unclaimed rebates: only for rebate-eligible vendors with specific patterns
+                WHEN t.vendor_id IN ('V001', 'V002', 'V005', 'V006', 'V007', 'V010') AND t.rand_val <= 0.15 AND t.rand_val >= 0.08 THEN TRUE
                 ELSE FALSE
             END AS is_suspicious,
-            -- Calculate payment amount (with fraud patterns)
+            -- Fraud TYPE determination for more granular patterns
+            CASE
+                WHEN t.rand_val < 0.03 OR (t.vendor_id IN ('V003', 'V004') AND t.rand_val < 0.04) OR 
+                     (t.approver_id IN ('APR001', 'APR002', 'APR003') AND t.rand_val < 0.05) THEN 'DUPLICATE'
+                WHEN t.rand_val < 0.08 OR (t.vendor_id IN ('V004') AND t.base_amount > 15000 AND t.rand_val < 0.12) THEN 'PRICING'
+                WHEN t.vendor_id IN ('V001', 'V002', 'V005', 'V006', 'V007', 'V010') AND t.rand_val <= 0.15 AND t.rand_val >= 0.08 THEN 'REBATE'
+                ELSE 'NORMAL'
+            END AS fraud_type,
+            -- Calculate payment amount with realistic error patterns
             CASE 
-                WHEN t.rand_val < 0.03 THEN t.base_amount * 2
-                WHEN t.rand_val < 0.08 THEN t.base_amount * (1 + UNIFORM(5, 25, RANDOM())/100.0)
+                -- Duplicates: exact 2x more common, but also 1.5x, 3x variations
+                WHEN t.rand_val < 0.02 THEN t.base_amount * 2.0
+                WHEN t.rand_val < 0.03 THEN t.base_amount * CASE UNIFORM(1,3,RANDOM()) WHEN 1 THEN 1.5 WHEN 2 THEN 2.0 ELSE 3.0 END
+                -- Pricing errors: percentage overcharges cluster around common markup amounts
+                WHEN t.rand_val < 0.05 THEN t.base_amount * (1 + CASE UNIFORM(1,4,RANDOM()) WHEN 1 THEN 0.10 WHEN 2 THEN 0.15 WHEN 3 THEN 0.20 ELSE 0.25 END)
+                WHEN t.rand_val < 0.08 THEN t.base_amount * (1 + UNIFORM(5, 30, RANDOM())/100.0)
+                -- Just-under-threshold amounts (fraud pattern: $9,900 when limit is $10K)
+                WHEN t.base_amount > 9000 AND t.base_amount < 11000 AND t.rand_val < 0.10 THEN 9900 + UNIFORM(0, 99, RANDOM())
+                WHEN t.base_amount > 24000 AND t.base_amount < 26000 AND t.rand_val < 0.10 THEN 24900 + UNIFORM(0, 99, RANDOM())
                 ELSE t.base_amount
             END AS calc_payment_amount
         FROM transactions t
@@ -234,7 +272,12 @@ BEGIN
         e.base_amount AS INVOICE_AMOUNT,
         e.base_amount * 0.98 AS PO_AMOUNT,
         e.quantity AS QUANTITY,
-        UNIFORM(-10, 60, RANDOM()) AS DAYS_TO_PAYMENT,
+        -- Days to payment: suspicious transactions often paid faster (urgent/rush)
+        CASE
+            WHEN e.is_suspicious AND UNIFORM(1, 100, RANDOM()) < 60 THEN UNIFORM(-5, 5, RANDOM())  -- Rush payment
+            WHEN e.is_rush_period THEN UNIFORM(-3, 15, RANDOM())  -- Month-end faster processing
+            ELSE UNIFORM(10, 45, RANDOM())  -- Normal payment timing
+        END AS DAYS_TO_PAYMENT,
         CASE e.vendor_id
             WHEN 'V001' THEN 30 WHEN 'V002' THEN 45 WHEN 'V003' THEN 15
             WHEN 'V004' THEN 60 WHEN 'V005' THEN 30 WHEN 'V006' THEN 30
@@ -252,8 +295,14 @@ BEGIN
             WHEN 1 THEN 'Finance' WHEN 2 THEN 'Operations'
             WHEN 3 THEN 'IT' WHEN 4 THEN 'HR' ELSE 'Marketing'
         END AS DEPARTMENT,
-        CASE e.payment_method_num
-            WHEN 1 THEN 'ACH' WHEN 2 THEN 'Wire' WHEN 3 THEN 'Check' ELSE 'Credit Card'
+        -- Payment method: suspicious transactions more likely Wire (faster, harder to reverse)
+        CASE 
+            WHEN e.is_suspicious AND UNIFORM(1, 100, RANDOM()) < 45 THEN 'Wire'
+            WHEN e.is_suspicious AND UNIFORM(1, 100, RANDOM()) < 70 THEN 'ACH'
+            WHEN e.payment_method_num = 1 THEN 'ACH' 
+            WHEN e.payment_method_num = 2 THEN 'Wire' 
+            WHEN e.payment_method_num = 3 THEN 'Check' 
+            ELSE 'Credit Card'
         END AS PAYMENT_METHOD,
         e.approver_id AS APPROVER_ID,
         e.rand_val < 0.02 AS IS_DUPLICATE_INVOICE,
@@ -277,208 +326,178 @@ BEGIN
             ELSE 0
         END AS OVERPAYMENT_FLAG,
         CASE 
-            -- Duplicate payment memos (suspicious patterns)
+            -- Duplicate payment memos (suspicious patterns) - STRONG OVERPAYMENT INDICATORS
             WHEN e.rand_val < 0.01 THEN 
-                CASE UNIFORM(1, 5, RANDOM())
-                    WHEN 1 THEN 'Resubmission of invoice ' || 'INV' || LPAD(e.rn::STRING, 8, '0') || ' - original payment not received'
-                    WHEN 2 THEN 'Duplicate payment request - urgent processing required'
-                    WHEN 3 THEN 'Second payment for same services - vendor claims non-receipt'
-                    WHEN 4 THEN 'Re-issued invoice after system error - please expedite'
-                    ELSE 'Payment resubmitted per vendor request - ref original batch'
+                CASE UNIFORM(1, 10, RANDOM())
+                    WHEN 1 THEN 'DUPLICATE PAYMENT ALERT: Resubmission of invoice ' || 'INV' || LPAD(e.rn::STRING, 8, '0') || ' - original payment not received - POSSIBLE OVERPAYMENT - verify against prior disbursements'
+                    WHEN 2 THEN 'WARNING: Duplicate payment request detected - urgent processing required - OVERPAYMENT RISK HIGH - same invoice paid twice - manual review mandatory'
+                    WHEN 3 THEN 'OVERPAYMENT DETECTED: Second payment for same services - vendor claims non-receipt of first payment - potential double-billing fraud - escalate immediately'
+                    WHEN 4 THEN 'DUPLICATE SUBMISSION: Re-issued invoice after system error - please expedite - OVERPAYMENT WARNING - cross-reference batch ' || UNIFORM(1000, 9999, RANDOM())::STRING || ' for prior payment'
+                    WHEN 5 THEN 'Payment resubmitted per vendor request - ref original batch - DUPLICATE OVERPAYMENT RISK - original transaction ID already processed - verify before release'
+                    WHEN 6 THEN 'CRITICAL OVERPAYMENT FLAG: Invoice previously paid on ' || DATEADD(day, -UNIFORM(5, 30, RANDOM()), e.payment_date)::VARCHAR || ' - duplicate detected - hold for audit confirmation'
+                    WHEN 7 THEN 'DOUBLE PAYMENT WARNING: Same vendor, same amount, same period - highly suspicious duplicate - overpayment investigation required - do not release'
+                    WHEN 8 THEN 'OVERPAYMENT ALERT: Vendor resubmitted after claiming check lost - original payment cleared bank - this is excess payment - recovery needed'
+                    WHEN 9 THEN 'DUPLICATE DETECTED: Payment matches prior disbursement within 30 days - OVERPAYMENT CONFIRMED - initiate recovery process ref ' || UNIFORM(10000, 99999, RANDOM())::STRING
+                    ELSE 'RED FLAG OVERPAYMENT: Multiple submissions for identical services - duplicate payment pattern detected - excess funds at risk - audit trail attached'
                 END
             WHEN e.rand_val < 0.03 THEN 
-                CASE UNIFORM(1, 5, RANDOM())
-                    WHEN 1 THEN 'Corrected invoice amount - disregard previous submission'
-                    WHEN 2 THEN 'Updated payment - previous transaction voided'
-                    WHEN 3 THEN 'Replacement payment for returned check'
-                    WHEN 4 THEN 'Reprocessed after bank rejection - same invoice'
-                    ELSE 'Manual override - duplicate approval obtained'
+                CASE UNIFORM(1, 10, RANDOM())
+                    WHEN 1 THEN 'OVERPAYMENT CORRECTION NEEDED: Invoice amount adjusted upward - disregard previous submission - OVERBILLING DETECTED - variance of $' || UNIFORM(500, 5000, RANDOM())::STRING || ' requires justification'
+                    WHEN 2 THEN 'VOIDED TRANSACTION OVERPAYMENT: Previous payment voided but funds already released - EXCESS PAYMENT - recovery action pending - do not issue replacement until confirmed'
+                    WHEN 3 THEN 'DUPLICATE CHECK REPLACEMENT: Original check cashed despite stop payment - OVERPAYMENT OCCURRED - vendor received funds twice - $' || ROUND(e.base_amount, 2)::VARCHAR || ' to recover'
+                    WHEN 4 THEN 'OVERPAYMENT WARNING: Reprocessed after bank rejection - same invoice - verify original was not honored before releasing - duplicate risk confirmed'
+                    WHEN 5 THEN 'MANUAL OVERRIDE OVERPAYMENT: Duplicate approval obtained bypassing controls - EXCESS PAYMENT AUTHORIZED - audit exception logged - recovery may be required'
+                    WHEN 6 THEN 'OVERPAYMENT INVESTIGATION: Same invoice submitted through multiple channels - consolidated overpayment of $' || UNIFORM(1000, 10000, RANDOM())::STRING || ' detected'
+                    WHEN 7 THEN 'DOUBLE-BILLED OVERPAYMENT: Vendor submitted duplicate under different invoice numbers - cross-reference reveals overpayment - flag for recovery'
+                    WHEN 8 THEN 'SYSTEM DUPLICATE OVERPAYMENT: Batch processing error caused duplicate disbursement - OVERPAYMENT CONFIRMED - initiate vendor credit request'
+                    WHEN 9 THEN 'OVERPAYMENT ALERT: ACH and check issued for same invoice - dual payment method overpayment - one payment must be reversed - excess funds $' || ROUND(e.base_amount, 2)::VARCHAR
+                    ELSE 'EXCESS PAYMENT DETECTED: Original transaction found in cleared items - this duplicate creates overpayment - recovery authorization required'
                 END
-            -- Pricing error memos (inflated amounts)
+            -- Pricing error memos (inflated amounts) - OVERPAYMENT INDICATORS
             WHEN e.rand_val < 0.05 THEN 
-                CASE UNIFORM(1, 5, RANDOM())
-                    WHEN 1 THEN 'Rush order surcharge applied - expedited delivery'
-                    WHEN 2 THEN 'Premium pricing tier - volume threshold not met'
-                    WHEN 3 THEN 'Price adjustment per vendor notification - market rates'
-                    WHEN 4 THEN 'Updated unit cost - raw material increase passed through'
-                    ELSE 'Non-contract pricing - spot purchase authorized'
+                CASE UNIFORM(1, 10, RANDOM())
+                    WHEN 1 THEN 'OVERCHARGE ALERT: Rush order surcharge applied without authorization - expedited delivery not requested - OVERPAYMENT of $' || UNIFORM(200, 2000, RANDOM())::STRING || ' - dispute required'
+                    WHEN 2 THEN 'PRICE VARIANCE OVERPAYMENT: Premium pricing tier charged - volume threshold WAS met - OVERBILLED by ' || UNIFORM(5, 25, RANDOM())::STRING || '% - contract rate should apply'
+                    WHEN 3 THEN 'OVERPAYMENT WARNING: Price adjustment per vendor notification exceeds contract cap - market rates not applicable - excess charge of $' || UNIFORM(500, 3000, RANDOM())::STRING
+                    WHEN 4 THEN 'OVERBILLING DETECTED: Updated unit cost passed through without approval - raw material increase not validated - OVERPAYMENT vs contracted rate confirmed'
+                    WHEN 5 THEN 'NON-CONTRACT OVERPAYMENT: Spot purchase pricing applied to contract items - OVERCHARGED $' || UNIFORM(1000, 5000, RANDOM())::STRING || ' - rebate pricing ignored'
+                    WHEN 6 THEN 'PRICE INFLATION OVERPAYMENT: Invoice exceeds PO amount by ' || UNIFORM(8, 30, RANDOM())::STRING || '% - no change order on file - EXCESS PAYMENT - dispute immediately'
+                    WHEN 7 THEN 'OVERCHARGE FLAG: List price billed instead of negotiated discount - OVERPAYMENT of ' || UNIFORM(10, 35, RANDOM())::STRING || '% above contract - recovery needed'
+                    WHEN 8 THEN 'PRICING ERROR OVERPAYMENT: Wrong SKU pricing applied - higher cost item billed - EXCESS CHARGE $' || UNIFORM(300, 3000, RANDOM())::STRING || ' detected'
+                    WHEN 9 THEN 'OVERPAYMENT AUDIT FINDING: Historical pricing shows ' || UNIFORM(15, 40, RANDOM())::STRING || '% increase without contract amendment - OVERBILLING pattern confirmed'
+                    ELSE 'EXCESSIVE CHARGE OVERPAYMENT: Fees exceed standard rate card by significant margin - OVERPAYMENT FLAG - requires pricing committee review'
                 END
             WHEN e.rand_val < 0.08 THEN 
-                CASE UNIFORM(1, 5, RANDOM())
-                    WHEN 1 THEN 'Emergency procurement - standard pricing waived'
-                    WHEN 2 THEN 'Vendor price increase effective this period'
-                    WHEN 3 THEN 'Additional fees for custom specifications'
-                    WHEN 4 THEN 'Fuel surcharge and handling fees included'
-                    ELSE 'Out-of-scope work - change order pricing applied'
+                CASE UNIFORM(1, 10, RANDOM())
+                    WHEN 1 THEN 'EMERGENCY PROCUREMENT OVERPAYMENT: Standard pricing waived without emergency declaration - OVERCHARGED $' || UNIFORM(500, 4000, RANDOM())::STRING || ' above normal rates'
+                    WHEN 2 THEN 'UNAPPROVED PRICE INCREASE OVERPAYMENT: Vendor price increase not in contract - EXCESS PAYMENT - rates locked until ' || DATEADD(month, UNIFORM(3, 12, RANDOM()), e.payment_date)::VARCHAR
+                    WHEN 3 THEN 'OVERPAYMENT FOR SPECIFICATIONS: Additional fees for custom specs already included in base - DOUBLE-CHARGED - excess of $' || UNIFORM(400, 2500, RANDOM())::STRING
+                    WHEN 4 THEN 'SURCHARGE OVERPAYMENT: Fuel surcharge and handling fees not per contract - OVERBILLED ' || UNIFORM(3, 15, RANDOM())::STRING || '% - dispute and recover excess'
+                    WHEN 5 THEN 'SCOPE CREEP OVERPAYMENT: Out-of-scope work billed at change order rates - work was in original scope - OVERPAYMENT of $' || UNIFORM(1000, 8000, RANDOM())::STRING
+                    WHEN 6 THEN 'RATE OVERPAYMENT: Billed at T&M rates despite fixed-price agreement - EXCESS CHARGE - contract violation - overpayment confirmed'
+                    WHEN 7 THEN 'QUANTITY OVERPAYMENT: Invoiced for ' || UNIFORM(110, 150, RANDOM())::STRING || ' units, only ' || UNIFORM(80, 100, RANDOM())::STRING || ' delivered - OVERBILLED - physical count required'
+                    WHEN 8 THEN 'TAX OVERPAYMENT: Sales tax charged on exempt items - OVERCHARGE of $' || UNIFORM(100, 1500, RANDOM())::STRING || ' - tax exemption certificate on file'
+                    WHEN 9 THEN 'MARKUP OVERPAYMENT: Distributor markup exceeds contractual ' || UNIFORM(5, 15, RANDOM())::STRING || '% cap - EXCESS MARGIN CHARGED - recovery action needed'
+                    ELSE 'UNAUTHORIZED FEE OVERPAYMENT: Administrative fees not in agreement - OVERPAYMENT FLAG - these charges are not legitimate per MSA terms'
                 END
-            -- Unclaimed rebate memos
+            -- Unclaimed rebate memos - OVERPAYMENT DUE TO MISSED REBATES
             WHEN e.vendor_id IN ('V001', 'V002', 'V005', 'V006', 'V007', 'V010') AND e.rand_val <= 0.12 AND e.rand_val >= 0.08 THEN 
-                CASE UNIFORM(1, 5, RANDOM())
-                    WHEN 1 THEN 'Standard payment - rebate to be claimed separately Q' || UNIFORM(1, 4, RANDOM())::STRING
-                    WHEN 2 THEN 'Volume rebate pending reconciliation - will process EOQ'
-                    WHEN 3 THEN 'Rebate credit memo expected from vendor next cycle'
-                    WHEN 4 THEN 'Payment processed - rebate tracking ref pending'
-                    ELSE 'Full invoice amount - rebate application deferred'
+                CASE UNIFORM(1, 10, RANDOM())
+                    WHEN 1 THEN 'REBATE OVERPAYMENT: Standard payment made - rebate should have been deducted - OVERPAID by $' || ROUND(e.base_amount * UNIFORM(2, 5, RANDOM())/100, 2)::VARCHAR || ' - Q' || UNIFORM(1, 4, RANDOM())::STRING || ' rebate not applied'
+                    WHEN 2 THEN 'VOLUME REBATE MISSED - OVERPAYMENT: Threshold met but discount not taken - EXCESS PAYMENT of ' || UNIFORM(2, 5, RANDOM())::STRING || '% - reconciliation shows overpayment'
+                    WHEN 3 THEN 'REBATE CREDIT OVERPAYMENT: Expected credit memo never received - OVERPAID THIS CYCLE - vendor owes $' || ROUND(e.base_amount * UNIFORM(15, 40, RANDOM())/1000, 2)::VARCHAR
+                    WHEN 4 THEN 'OVERPAYMENT - REBATE TRACKING FAILURE: Payment processed at gross - rebate ref pending - NET OVERPAYMENT confirmed - add to recovery queue'
+                    WHEN 5 THEN 'DEFERRED REBATE OVERPAYMENT: Full invoice amount paid - rebate application deferred indefinitely - CHRONIC OVERPAYMENT PATTERN - $' || ROUND(e.base_amount * UNIFORM(2, 4, RANDOM())/100, 2)::VARCHAR || ' not recovered'
+                    WHEN 6 THEN 'OVERPAYMENT ALERT: Eligible rebate of ' || UNIFORM(2, 5, RANDOM())::STRING || '% not deducted - PAID GROSS INSTEAD OF NET - overpayment accumulating'
+                    WHEN 7 THEN 'REBATE LEAKAGE OVERPAYMENT: Contract rebate ignored in payment calculation - SYSTEMATIC OVERPAYMENT - YTD excess $' || UNIFORM(5000, 25000, RANDOM())::STRING
+                    WHEN 8 THEN 'MISSED DISCOUNT OVERPAYMENT: Early payment discount not taken despite eligible date - OVERPAID ' || UNIFORM(1, 3, RANDOM())::STRING || '% - $' || ROUND(e.base_amount * UNIFORM(1, 3, RANDOM())/100, 2)::VARCHAR
+                    WHEN 9 THEN 'OVERPAYMENT DUE TO REBATE TIMING: Rebate period active but not applied - EXCESS PAYMENT - vendor compliance issue - initiate credit request'
+                    ELSE 'REBATE RECOVERY OVERPAYMENT: Paid without contractual deduction - OVERPAYMENT CONFIRMED - rebate recapture needed - vendor contact required'
                 END
             WHEN e.vendor_id IN ('V001', 'V002', 'V005', 'V006', 'V007', 'V010') AND e.rand_val <= 0.15 AND e.rand_val >= 0.12 THEN 
-                CASE UNIFORM(1, 5, RANDOM())
-                    WHEN 1 THEN 'Rebate not applied - below quarterly threshold'
-                    WHEN 2 THEN 'Vendor rebate program under review - paid gross'
-                    WHEN 3 THEN 'Credit memo for rebate to follow per agreement'
-                    WHEN 4 THEN 'Rebate calculation pending final volume tally'
-                    ELSE 'Gross payment - rebate reconciliation scheduled'
+                CASE UNIFORM(1, 10, RANDOM())
+                    WHEN 1 THEN 'THRESHOLD OVERPAYMENT: Rebate not applied despite meeting quarterly threshold - OVERPAID - retroactive credit of $' || ROUND(e.base_amount * UNIFORM(2, 4, RANDOM())/100, 2)::VARCHAR || ' due'
+                    WHEN 2 THEN 'PROGRAM REVIEW OVERPAYMENT: Vendor rebate program under review - paid gross - OVERPAYMENT CONTINUES - ' || UNIFORM(3, 8, RANDOM())::STRING || ' months of excess payments'
+                    WHEN 3 THEN 'CREDIT MEMO OVERPAYMENT: Credit for rebate never followed - OUTSTANDING OVERPAYMENT - vendor balance shows $' || UNIFORM(2000, 15000, RANDOM())::STRING || ' owed to us'
+                    WHEN 4 THEN 'REBATE CALCULATION OVERPAYMENT: Final volume exceeded tier - higher rebate rate applies - UNDERCLAIMED by $' || ROUND(e.base_amount * UNIFORM(1, 3, RANDOM())/100, 2)::VARCHAR || ' - OVERPAYMENT'
+                    WHEN 5 THEN 'GROSS PAYMENT OVERPAYMENT: Rebate reconciliation scheduled but never performed - CHRONIC OVERPAYMENT - recovery backlog growing'
+                    WHEN 6 THEN 'OVERPAYMENT FLAG: Net price should be $' || ROUND(e.base_amount * 0.97, 2)::VARCHAR || ' but paid $' || ROUND(e.base_amount, 2)::VARCHAR || ' - rebate missing - EXCESS $' || ROUND(e.base_amount * 0.03, 2)::VARCHAR
+                    WHEN 7 THEN 'ANNUAL REBATE OVERPAYMENT: Year-end true-up not processed - CUMULATIVE OVERPAYMENT - vendor owes significant credit - audit in progress'
+                    WHEN 8 THEN 'TIERED REBATE OVERPAYMENT: Wrong tier applied - volume qualifies for ' || UNIFORM(3, 6, RANDOM())::STRING || '% but only ' || UNIFORM(1, 2, RANDOM())::STRING || '% taken - OVERPAYMENT CONFIRMED'
+                    WHEN 9 THEN 'RETROSPECTIVE REBATE OVERPAYMENT: Rebate effective date passed - prior payments not adjusted - HISTORICAL OVERPAYMENT of $' || UNIFORM(3000, 20000, RANDOM())::STRING
+                    ELSE 'COMPLIANCE REBATE OVERPAYMENT: Vendor required to provide rebate per contract - NOT HONORED - OVERPAYMENT EACH INVOICE - escalate to procurement'
                 END
-            -- Normal transaction memos
+            -- Normal transaction memos - simple, routine language with no risk indicators
             ELSE 
-                CASE 
-                    WHEN e.vendor_id = 'V001' THEN 
-                        CASE UNIFORM(1, 6, RANDOM())
-                            WHEN 1 THEN 'Office supplies order - ' || UNIFORM(1, 12, RANDOM())::STRING || ' month replenishment'
-                            WHEN 2 THEN 'Stationery and paper products per standing order'
-                            WHEN 3 THEN 'Desk supplies for new hire onboarding batch'
-                            WHEN 4 THEN 'Printer cartridges and toner - scheduled delivery'
-                            WHEN 5 THEN 'Break room supplies - monthly restocking'
-                            ELSE 'General office supplies per approved requisition'
-                        END
-                    WHEN e.vendor_id = 'V002' THEN 
-                        CASE UNIFORM(1, 6, RANDOM())
-                            WHEN 1 THEN 'Laptop computers for ' || CASE e.dept_num WHEN 1 THEN 'Finance' WHEN 2 THEN 'Operations' WHEN 3 THEN 'IT' WHEN 4 THEN 'HR' ELSE 'Marketing' END || ' team'
-                            WHEN 2 THEN 'Network switches and cabling - infrastructure upgrade'
-                            WHEN 3 THEN 'Monitors and docking stations - hybrid work setup'
-                            WHEN 4 THEN 'Server hardware refresh - datacenter project'
-                            WHEN 5 THEN 'Peripheral equipment - keyboards and mice bulk order'
-                            ELSE 'IT equipment per approved capital expenditure'
-                        END
-                    WHEN e.vendor_id = 'V003' THEN 
-                        CASE UNIFORM(1, 6, RANDOM())
-                            WHEN 1 THEN 'Freight charges - shipment tracking #SHP' || UNIFORM(100000, 999999, RANDOM())::STRING
-                            WHEN 2 THEN 'Domestic shipping - ' || UNIFORM(5, 50, RANDOM())::STRING || ' packages'
-                            WHEN 3 THEN 'Express delivery services - time-sensitive materials'
-                            WHEN 4 THEN 'International freight - customs cleared'
-                            WHEN 5 THEN 'Monthly logistics services per contract terms'
-                            ELSE 'Shipping and handling charges - standard rates'
-                        END
-                    WHEN e.vendor_id = 'V004' THEN 
-                        CASE UNIFORM(1, 6, RANDOM())
-                            WHEN 1 THEN 'Management consulting - Phase ' || UNIFORM(1, 4, RANDOM())::STRING || ' deliverables'
-                            WHEN 2 THEN 'Strategic advisory services - ' || UNIFORM(40, 200, RANDOM())::STRING || ' hours billed'
-                            WHEN 3 THEN 'Process improvement engagement - milestone payment'
-                            WHEN 4 THEN 'Due diligence support - project completion'
-                            WHEN 5 THEN 'Training and workshop facilitation services'
-                            ELSE 'Professional services per statement of work'
-                        END
-                    WHEN e.vendor_id = 'V005' THEN 
-                        CASE UNIFORM(1, 6, RANDOM())
-                            WHEN 1 THEN 'Machine parts order - production line ' || UNIFORM(1, 8, RANDOM())::STRING
-                            WHEN 2 THEN 'Replacement components - preventive maintenance'
-                            WHEN 3 THEN 'Raw materials - Q' || UNIFORM(1, 4, RANDOM())::STRING || ' production schedule'
-                            WHEN 4 THEN 'Specialty tooling and fixtures - custom fabrication'
-                            WHEN 5 THEN 'Safety equipment and PPE - compliance order'
-                            ELSE 'Manufacturing supplies per production requirements'
-                        END
-                    WHEN e.vendor_id = 'V006' THEN 
-                        CASE UNIFORM(1, 6, RANDOM())
-                            WHEN 1 THEN 'Janitorial services - ' || CASE UNIFORM(1, 3, RANDOM()) WHEN 1 THEN 'Building A' WHEN 2 THEN 'Building B' ELSE 'HQ Campus' END
-                            WHEN 2 THEN 'Deep cleaning services - quarterly schedule'
-                            WHEN 3 THEN 'Facility maintenance - HVAC filter replacement'
-                            WHEN 4 THEN 'Landscaping and grounds maintenance - monthly'
-                            WHEN 5 THEN 'Waste management and recycling services'
-                            ELSE 'Facilities services per maintenance agreement'
-                        END
-                    WHEN e.vendor_id = 'V007' THEN 
-                        CASE UNIFORM(1, 6, RANDOM())
-                            WHEN 1 THEN 'Cloud hosting services - ' || CASE UNIFORM(1, 3, RANDOM()) WHEN 1 THEN 'production' WHEN 2 THEN 'development' ELSE 'DR' END || ' environment'
-                            WHEN 2 THEN 'Managed security services - SOC monitoring'
-                            WHEN 3 THEN 'Data backup and recovery - monthly subscription'
-                            WHEN 4 THEN 'Software licensing - ' || UNIFORM(50, 500, RANDOM())::STRING || ' seats'
-                            WHEN 5 THEN 'IT support services - ' || UNIFORM(100, 300, RANDOM())::STRING || ' tickets resolved'
-                            ELSE 'IT services per master service agreement'
-                        END
-                    WHEN e.vendor_id = 'V008' THEN 
-                        CASE UNIFORM(1, 6, RANDOM())
-                            WHEN 1 THEN 'Marketing collateral - ' || UNIFORM(500, 5000, RANDOM())::STRING || ' units printed'
-                            WHEN 2 THEN 'Trade show materials - booth displays and banners'
-                            WHEN 3 THEN 'Business cards and letterhead - brand refresh'
-                            WHEN 4 THEN 'Product brochures - new launch campaign'
-                            WHEN 5 THEN 'Promotional items - customer appreciation gifts'
-                            ELSE 'Print services per marketing department request'
-                        END
-                    WHEN e.vendor_id = 'V009' THEN 
-                        CASE UNIFORM(1, 6, RANDOM())
-                            WHEN 1 THEN 'General liability insurance - annual premium Q' || UNIFORM(1, 4, RANDOM())::STRING
-                            WHEN 2 THEN 'Property insurance - coverage period ' || UNIFORM(2024, 2026, RANDOM())::STRING
-                            WHEN 3 THEN 'Workers compensation - quarterly installment'
-                            WHEN 4 THEN 'Professional liability - E&O coverage renewal'
-                            WHEN 5 THEN 'Cyber insurance premium - policy year ' || UNIFORM(2024, 2026, RANDOM())::STRING
-                            ELSE 'Insurance premium per policy schedule'
-                        END
-                    ELSE 
-                        CASE UNIFORM(1, 6, RANDOM())
-                            WHEN 1 THEN 'Hardware refresh - workstation upgrades dept-wide'
-                            WHEN 2 THEN 'Storage expansion - SAN capacity increase'
-                            WHEN 3 THEN 'Networking equipment - branch office deployment'
-                            WHEN 4 THEN 'Security hardware - firewall and IDS appliances'
-                            WHEN 5 THEN 'Telecom equipment - VoIP phone system'
-                            ELSE 'IT equipment procurement per approved budget'
-                        END
+                CASE UNIFORM(1, 20, RANDOM())
+                    WHEN 1 THEN 'Monthly supplies'
+                    WHEN 2 THEN 'Standard order'
+                    WHEN 3 THEN 'Regular delivery'
+                    WHEN 4 THEN 'Scheduled service'
+                    WHEN 5 THEN 'Routine maintenance'
+                    WHEN 6 THEN 'Weekly shipment'
+                    WHEN 7 THEN 'Contract service'
+                    WHEN 8 THEN 'Standing order'
+                    WHEN 9 THEN 'Quarterly service'
+                    WHEN 10 THEN 'Annual subscription'
+                    WHEN 11 THEN 'Regular purchase'
+                    WHEN 12 THEN 'Standard delivery'
+                    WHEN 13 THEN 'Recurring service'
+                    WHEN 14 THEN 'Planned order'
+                    WHEN 15 THEN 'Routine order'
+                    WHEN 16 THEN 'Monthly service'
+                    WHEN 17 THEN 'Standard purchase'
+                    WHEN 18 THEN 'Regular service'
+                    WHEN 19 THEN 'Scheduled delivery'
+                    ELSE 'Normal transaction'
                 END
         END AS PAYMENT_MEMO,
-        -- Benford's Law: First digit of payment amount (fraudulent transactions skewed away from natural distribution)
+        -- Benford's Law: First digit (fraudulent amounts deviate from natural log distribution)
+        SUBSTRING(CAST(FLOOR(e.calc_payment_amount) AS VARCHAR), 1, 1)::INT AS FIRST_DIGIT,
+        -- Round amount indicator: fraudulent amounts cluster at round numbers
         CASE 
-            WHEN e.is_suspicious AND UNIFORM(1, 100, RANDOM()) < 30 
-            THEN UNIFORM(5, 9, RANDOM())  -- Suspicious: bias toward higher first digits
-            ELSE SUBSTRING(CAST(FLOOR(e.calc_payment_amount) AS VARCHAR), 1, 1)::INT
-        END AS FIRST_DIGIT,
-        -- Round amount indicator (suspicious amounts more likely to be round)
-        CASE 
-            WHEN e.is_suspicious AND UNIFORM(1, 100, RANDOM()) < 40 THEN TRUE
-            WHEN MOD(FLOOR(e.calc_payment_amount), 100) = 0 THEN TRUE
+            WHEN e.fraud_type = 'DUPLICATE' AND UNIFORM(1, 100, RANDOM()) < 50 THEN TRUE  -- Duplicates often round
+            WHEN e.fraud_type = 'PRICING' AND UNIFORM(1, 100, RANDOM()) < 35 THEN TRUE  -- Pricing errors sometimes round
+            WHEN MOD(FLOOR(e.calc_payment_amount), 1000) = 0 THEN TRUE
+            WHEN MOD(FLOOR(e.calc_payment_amount), 500) = 0 AND UNIFORM(1,100,RANDOM()) < 30 THEN TRUE
             ELSE FALSE
         END AS IS_ROUND_AMOUNT,
-        -- Invoice velocity: suspicious vendors have unusual spikes
+        -- Invoice velocity: problem vendors and rush periods show spikes
         CASE 
-            WHEN e.is_suspicious THEN UNIFORM(8, 25, RANDOM())  -- Anomalous spike
-            ELSE UNIFORM(1, 6, RANDOM())  -- Normal volume
+            WHEN e.is_problem_vendor AND e.is_suspicious THEN UNIFORM(12, 30, RANDOM())
+            WHEN e.is_rush_period AND e.is_suspicious THEN UNIFORM(10, 25, RANDOM())
+            WHEN e.is_suspicious THEN UNIFORM(8, 20, RANDOM())
+            WHEN e.is_rush_period THEN UNIFORM(4, 10, RANDOM())  -- Normal month-end increase
+            ELSE UNIFORM(1, 6, RANDOM())
         END AS VENDOR_INVOICE_COUNT_7D,
-        -- Historical average for this vendor (baseline)
-        UNIFORM(2, 5, RANDOM())::DECIMAL(8,2) AS VENDOR_AVG_INVOICE_COUNT_7D,
-        -- Days since last invoice from vendor (low = potential rapid-fire invoicing)
+        -- Historical average by vendor (creates learnable baseline)
+        CASE e.vendor_id
+            WHEN 'V001' THEN 3.2 WHEN 'V002' THEN 2.8 WHEN 'V003' THEN 4.5
+            WHEN 'V004' THEN 1.9 WHEN 'V005' THEN 3.7 WHEN 'V006' THEN 2.1
+            WHEN 'V007' THEN 2.5 WHEN 'V008' THEN 1.5 WHEN 'V009' THEN 0.8
+            ELSE 2.9
+        END::DECIMAL(8,2) AS VENDOR_AVG_INVOICE_COUNT_7D,
+        -- Days since last invoice: rapid-fire invoicing correlates with duplicates
         CASE 
-            WHEN e.is_suspicious AND UNIFORM(1, 100, RANDOM()) < 50 THEN UNIFORM(0, 2, RANDOM())  -- Very recent
-            ELSE UNIFORM(3, 30, RANDOM())
+            WHEN e.fraud_type = 'DUPLICATE' THEN UNIFORM(0, 3, RANDOM())  -- Very recent = duplicate risk
+            WHEN e.is_suspicious THEN UNIFORM(1, 7, RANDOM())
+            ELSE UNIFORM(5, 45, RANDOM())
         END AS DAYS_SINCE_LAST_VENDOR_INVOICE,
-        -- Invoice splitting: multiple invoices per PO
+        -- Invoice splitting pattern: correlates with threshold avoidance
         CASE 
-            WHEN e.is_suspicious AND UNIFORM(1, 100, RANDOM()) < 35 THEN UNIFORM(3, 8, RANDOM())  -- Suspicious splitting
+            WHEN e.calc_payment_amount BETWEEN 9000 AND 10000 THEN UNIFORM(3, 6, RANDOM())  -- Splitting to stay under $10K
+            WHEN e.calc_payment_amount BETWEEN 24000 AND 25000 THEN UNIFORM(2, 5, RANDOM())  -- Splitting to stay under $25K
+            WHEN e.is_suspicious AND e.fraud_type = 'PRICING' THEN UNIFORM(2, 4, RANDOM())
             ELSE UNIFORM(1, 2, RANDOM())
         END AS INVOICES_PER_PO,
-        -- Approver-vendor affinity (same approver always approving same vendor = collusion risk)
+        -- Approver-vendor affinity: high-risk approvers show patterns
         CASE 
-            WHEN e.is_suspicious AND UNIFORM(1, 100, RANDOM()) < 40 THEN UNIFORM(15, 50, RANDOM())  -- High affinity
-            ELSE UNIFORM(1, 10, RANDOM())
+            WHEN e.is_high_risk_approver AND e.is_suspicious THEN UNIFORM(25, 75, RANDOM())  -- Collusion signal
+            WHEN e.is_high_risk_approver THEN UNIFORM(15, 40, RANDOM())
+            WHEN e.is_suspicious THEN UNIFORM(10, 25, RANDOM())
+            ELSE UNIFORM(1, 12, RANDOM())
         END AS APPROVER_VENDOR_TRANSACTION_COUNT,
-        -- Weekend/holiday submission (suspicious)
+        -- Weekend/off-hours: strong correlation with suspicious activity
         CASE 
-            WHEN e.is_suspicious AND UNIFORM(1, 100, RANDOM()) < 25 THEN TRUE
-            WHEN e.dow IN (0, 6) THEN TRUE  -- Saturday=6, Sunday=0
+            WHEN e.is_off_hours AND e.is_suspicious THEN TRUE
+            WHEN e.is_off_hours AND UNIFORM(1, 100, RANDOM()) < 40 THEN TRUE  -- Off-hours more often flagged
+            WHEN e.dow IN (0, 6) THEN TRUE
             ELSE FALSE
         END AS IS_WEEKEND_SUBMISSION,
-        -- Month-end rush (higher risk period)
+        -- Month-end: correlates with rush processing errors
+        e.is_rush_period AS IS_MONTH_END,
+        -- Invoice number gaps: correlates with cherry-picking
         CASE 
-            WHEN e.is_suspicious AND UNIFORM(1, 100, RANDOM()) < 35 THEN TRUE
-            WHEN e.dom >= 28 THEN TRUE
-            ELSE FALSE
-        END AS IS_MONTH_END,
-        -- Sequential invoice number gaps (missing numbers = cherry-picked submissions)
-        CASE 
-            WHEN e.is_suspicious AND UNIFORM(1, 100, RANDOM()) < 30 THEN UNIFORM(5, 20, RANDOM())  -- Large gap
-            ELSE UNIFORM(0, 2, RANDOM())
+            WHEN e.fraud_type = 'DUPLICATE' AND UNIFORM(1, 100, RANDOM()) < 60 THEN UNIFORM(8, 25, RANDOM())  -- Large gaps
+            WHEN e.is_suspicious THEN UNIFORM(3, 12, RANDOM())
+            ELSE UNIFORM(0, 3, RANDOM())
         END AS SEQUENTIAL_INVOICE_GAP,
-        -- Just-under-threshold amounts (e.g., $9,999 when limit is $10K)
+        -- Amount vs threshold: just-under pattern is strong fraud signal
         CASE 
-            WHEN e.is_suspicious AND UNIFORM(1, 100, RANDOM()) < 30 
-            THEN 0.95 + (UNIFORM(1, 4, RANDOM()) / 100.0)  -- 95-99% of threshold
-            ELSE UNIFORM(20, 80, RANDOM()) / 100.0  -- Normal distribution
+            WHEN e.calc_payment_amount BETWEEN 9500 AND 9999 THEN 0.95 + (e.calc_payment_amount - 9500) / 10000.0
+            WHEN e.calc_payment_amount BETWEEN 24500 AND 24999 THEN 0.98 + (e.calc_payment_amount - 24500) / 50000.0
+            WHEN e.calc_payment_amount BETWEEN 49500 AND 49999 THEN 0.99 + (e.calc_payment_amount - 49500) / 100000.0
+            ELSE e.calc_payment_amount / 50000.0  -- Normalized ratio
         END AS AMOUNT_VS_APPROVAL_THRESHOLD
     FROM enriched e;
     
